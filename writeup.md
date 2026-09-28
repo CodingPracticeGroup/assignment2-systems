@@ -261,6 +261,173 @@ nsys 测到的 forward GPU 时间与 Python `timeit` 的结果**吻合到 0.1%�
 > 注：softmax 的 "5 ops/element" 是常用近似（max / sub / exp / sum / div）；即使按 4 或 6 计，结论（差约两个数量级）不变。
 
 ---
+
+---
+
+# Problem (mixed_precision_accumulation): Mixed-Precision Accumulation (1 point)
+
+## 题目（原文）
+
+> Run the following code and comment on the accuracy of the results.
+>
+> ```python
+> s = torch.tensor(0,dtype=torch.float32)
+> for i in range(1000):
+>     s += torch.tensor(0.01,dtype=torch.float32)
+> print(s)
+> s = torch.tensor(0,dtype=torch.float16)
+> for i in range(1000):
+>     s += torch.tensor(0.01,dtype=torch.float16)
+> print(s)
+> s = torch.tensor(0,dtype=torch.float32)
+> for i in range(1000):
+>     s += torch.tensor(0.01,dtype=torch.float16)
+> print(s)
+> s = torch.tensor(0,dtype=torch.float32)
+> for i in range(1000):
+>     x = torch.tensor(0.01,dtype=torch.float16)
+>     s += x.type(torch.float32)
+> print(s)
+> ```
+>
+> _Deliverable:_ A 2-3 sentence response.
+
+## 实测结果
+
+脚本：`cs336_systems/mixed_precision_accumulation.py`（循环 1000 次、每次加 0.01，数学精确值 = **10**）。
+
+| 方案 | 结果 | 绝对误差 | 相对误差 |
+|---|---:|---:|---:|
+| **①** `s=fp32, 加数=fp32` | 10.000134 | +0.000134 | +1.3 × 10⁻⁵ |
+| **②** `s=fp16, 加数=fp16` | **9.953125** | **−0.046875** | **−4.7 × 10⁻³** |
+| **③** `s=fp32, 加数=fp16` | 10.002136 | +0.002136 | +2.1 × 10⁻⁴ |
+| **④** `s=fp32, 加数 fp16→fp32` | **10.002136** | +0.002136 | +2.1 × 10⁻⁴ |
+
+关键的中间量：
+
+| 量 | 值 |
+|---|---:|
+| `0.01` 在 fp32 里的实际值 | 0.009999999776（误差 −2.2 × 10⁻¹⁰） |
+| `0.01` 在 fp16 里的实际值 | **0.010002136230**（误差 **+2.1 × 10⁻⁶**） |
+| **1000 × fp16 的加数误差** | **+0.002136** ← 与 ③④ 的误差**完全相等** |
+| fp16 在 10 附近的 ULP | 0.0078125（略小于 0.01，所以还能加上去，但每步都被舍入） |
+
+### 回答
+
+**四个结果分成三档**：全 fp32（①）误差仅 1.3 × 10⁻⁵，是可信基准；**把累加器也放到 fp16（②）结果严重偏低（9.953，误差 −0.047）**，因为每一步 `s += 0.01` 都在 fp16 里舍入（在 s ≈ 10 处 ULP 已达 0.0078，每步的舍入误差不断累积）；而**累加器保持 fp32、只把加数降到 fp16（③④）误差小一个数量级（+0.0021）**。
+
+**③ 与 ④ 的结果逐位相同** —— 说明 PyTorch 的 **type promotion 已经自动把 fp16 加数提升到 fp32 再相加**，显式 `.type(torch.float32)` 是数值上的 no-op。而且 **③④ 的误差恰好等于 `1000 × (fp16(0.01) − 0.01) = +0.002136`**，即误差 **100% 来自"0.01 本身存不进 fp16"这个表示误差**，累加过程没有额外放大它。
+
+**结论（也是混合精度训练的核心规则）**：必须把「**累加器精度**」与「**加数精度**」分开——加数（权重/激活）可以降到 fp16/bf16，但**累加必须留在 fp32**，这正是 ③ 的模式、也正是 tensor core 用 fp16/bf16 做乘法却用 fp32 累加的原因；②与③的误差差 **22 倍**，说明**累加器精度是主导因素**。
+
+---
+
+# Problem (benchmarking_mixed_precision): Benchmarking Mixed Precision (2 points)
+
+## 题目（原文）
+
+> **(a)** Consider the following model:
+>
+> ```python
+> class ToyModel(nn.Module):
+>     def __init__(self, in_features: int, out_features: int):
+>         super().__init__()
+>         self.fc1 = nn.Linear(in_features, 10, bias=False)
+>         self.ln = nn.LayerNorm(10)
+>         self.fc2 = nn.Linear(10, out_features, bias=False)
+>         self.relu = nn.ReLU()
+>     def forward(self, x):
+>         x = self.relu(self.fc1(x))
+>         x = self.ln(x)
+>         x = self.fc2(x)
+>         return x
+> ```
+>
+> Suppose we are training the model on a GPU and that the model parameters are originally in FP32. We'd like to use autocasting mixed precision with FP16. What are the data types of:
+> - the model parameters within the autocast context?
+> - the output of the first feed-forward layer (`ToyModel.fc1`)?
+> - the output of layer norm (`ToyModel.ln`)?
+> - the model's predicted logits?
+> - the loss?
+> - the model's gradients?
+>
+> _Deliverable:_ The data types for each of the components listed above.
+>
+> **(b)** You should have seen that FP16 mixed precision autocasting treats the layer normalization layer differently than the feed-forward layers. What parts of layer normalization are sensitive to mixed precision? If we use BF16 instead of FP16, do we still need to treat layer normalization differently? Why or why not?
+>
+> _Deliverable:_ A 2-3 sentence response.
+>
+> **(c)** Modify your benchmarking script to optionally run the model using mixed precision with BF16. Time the forward and backward passes with and without mixed-precision for each language model size described in Section 2.1.2. Compare the results of using full precision versus mixed precision, and comment on any trends as model size changes. You may find the `nullcontext` no-op context manager to be useful.
+>
+> _Deliverable:_ A 2-3 sentence response with your timings.
+
+---
+
+## (a) 各部件的 dtype（实测，非推断）
+
+脚本：`cs336_systems/mixed_precision_dtypes.py`（用 `register_forward_hook` 抓算子输出、backward 后查 `.grad`）。
+
+| 部件 | autocast 关闭 | **autocast(fp16)** | autocast(bf16) |
+|---|---|---|---|
+| 模型参数（在 autocast 上下文**内部**读） | float32 | **float32** | float32 |
+| `ToyModel.fc1` 输出 | float32 | **float16** | bfloat16 |
+| **`ToyModel.ln` 输出（LayerNorm）** | float32 | **float32** ⭐ | **float32** ⭐ |
+| 模型预测 logits（`fc2` 输出） | float32 | **float16** | bfloat16 |
+| **loss** | float32 | **float32** | float32 |
+| 模型梯度 | float32 | **float32** | float32 |
+| backward 之后的参数 | float32 | float32 | float32 |
+
+### 回答
+
+**参数、LayerNorm 输出、loss、梯度全部保持 float32；只有 `fc1` / `fc2` / logits 变成 float16。** 具体地：模型参数**在 autocast 内仍是 fp32**（autocast 不改参数本身，只在算子内部临时 cast 权重与输入）；`fc1` 输出 fp16（矩阵乘走 tensor core）；**`ln` 输出 fp32**（LayerNorm 在 autocast 的 fp32 白名单里）；logits 是 fp16（`fc2` 又是矩阵乘）；**loss 是 fp32**（`cross_entropy` 内部的 `log_softmax` 与 `nll_loss` 都在 fp32 名单里）；**梯度是 fp32**（反向把 fp16 中间结果的梯度累加回 fp32 参数）。
+
+---
+
+## (b) LayerNorm 哪些部分对混合精度敏感
+
+`autocast(fp16)` 下实测的数值误差：
+
+| 量 | 结果 |
+|---|---|
+| fp32 重算的 mean / var | +2.91854453 / +4.82945633 |
+| **fp16 重算的 mean / var** | +2.91796875 / **+4.83203125** |
+| → mean 绝对误差 / var 绝对误差 | 5.8 × 10⁻⁴ / **2.6 × 10⁻³** |
+| → 归一化输出的最大差 | 2.0 × 10⁻³ |
+
+| dtype | max | 最小正规数 | eps（尾数精度） |
+|---|---:|---:|---:|
+| **fp16** | **6.55 × 10⁴** | 6.10 × 10⁻⁵ | 9.8 × 10⁻⁴ |
+| **bf16** | **3.39 × 10³⁸** | 1.18 × 10⁻³⁸ | 7.8 × 10⁻³ |
+| fp32 | 3.40 × 10³⁸ | 1.18 × 10⁻³⁸ | 1.2 × 10⁻⁷ |
+
+### 回答
+
+LayerNorm 里有三处对 fp16 敏感：**① 归约量 mean/var** —— `var = E[x²] − E[x]²` 是"两个大数相减"，fp16 只有 10 位尾数，有效位损失被放大（实测 var 误差 2.6 × 10⁻³，比 mean 的误差大 4 倍，并经 `1/sqrt(var+eps)` 传给输出）；**② `eps`** —— 默认 `eps = 1e-5` **在 fp16 里根本无法表示**（fp16 最小正规数 6.1 × 10⁻⁵），会被舍成 0 或 6.1 × 10⁻⁵，直接改变数值稳定性；**③ 动态范围** —— fp16 的 `max` 只有 6.55 × 10⁴，归一化前的激活（尤其大模型、长序列）很容易越界成 `inf`。
+
+**换成 bf16 则不需要特别对待**：bf16 的**指数位与 fp32 相同（8 位）**，动态范围 3.39 × 10³⁸ 与 fp32 完全一致，不会溢出（代价仅是尾数更少、`eps` 更大 7.8 × 10⁻³，但 LayerNorm 的主要风险是溢出而非精度）。**实测补充**：PyTorch 的 autocast 对 bf16 **也照样把 LayerNorm 放在 fp32 名单里**（输出仍是 float32）——这是保守的工程策略，而不是 bf16 的必要性。
+
+---
+
+## (c) full precision vs BF16 的实测对比
+
+**配置**：batch = 4，context = 512，vocab = 10000，**5 warmup + 10 计时步**（均值 ± 标准差，单位 ms）。bf16 通过 `torch.autocast(device_type="cuda", dtype=torch.bfloat16)`；不用 autocast 时用 `contextlib.nullcontext()`。
+
+| 规模 | 模式 | fp32 | **bf16** | **加速比** | 峰值显存 fp32 → bf16 |
+|---|---|---:|---:|---:|---|
+| **small**（128.6 M） | forward | 86.55 ± 0.04 | 52.75 ± 0.05 | **1.64×** | 3.82 → 2.97 GB（−22%） |
+| **small** | forward+backward | 276.91 ± 0.12 | 170.58 ± 0.06 | **1.62×** | 4.55 → 3.66 GB（−20%） |
+| **medium**（423.2 M） | forward | 264.44 ± 0.07 | 153.67 ± 0.04 | **1.72×** | 10.33 → 8.16 GB（−21%） |
+| **medium** | forward+backward | 838.39 ± 0.49 | 498.52 ± 0.04 | **1.68×** | 12.14 → 9.93 GB（−18%） |
+
+`large` / `xl` / `10B` 在本机 16 GB 卡上 OOM（原因见前文 `benchmarking_script` (b)），未测。
+
+### 回答
+
+**BF16 混合精度带来约 1.6–1.7× 的加速，且加速比随模型变大而略微上升**（forward：small 1.64× → medium 1.72×），因为越大的模型矩阵乘占比越高，而矩阵乘正是 bf16 tensor core 受益最大的部分；**显存同步下降约 20%**（small 3.82 → 2.97 GB，medium 10.33 → 8.16 GB），来自激活值减半（参数与优化器状态仍是 fp32）。
+
+**为什么只有 1.6–1.7×、而不是按 tensor core 峰值算出的好几倍？Amdahl 定律给出定量解释**：前一个 problem 实测出 forward 里**只有约 53%（small）/ 58%（medium）的时间是矩阵乘**，其余是 elementwise / softmax / LayerNorm 等不吃 tensor core 的算子，且 LayerNorm 与 loss 仍固定在 fp32。若假设矩阵乘在 bf16 下快 4×、非矩阵乘不变，则预测加速 = `1 / (0.53/4 + 0.47) = 1.66×`（medium 为 1.78×）——**与实测的 1.64× / 1.72× 吻合**。这也说明：**要进一步吃到低精度红利，必须先把那些非矩阵乘算子也优化掉**（正是 §4 FlashAttention 的动机）。
+
+---
 ---
 
 # 附：本机环境、已知坑与复现
