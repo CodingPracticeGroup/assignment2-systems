@@ -64,6 +64,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--profiler-range", action="store_true",
                    help="用 cudaProfilerStart/Stop 把正式计时段包起来；"
                         "配合 nsys -c cudaProfilerApi 跳过 warmup（本机实测：-c nvtx 触发不灵，此路可用）")
+    p.add_argument("--annotate-attention", action="store_true",
+                   help="把 self-attention 换成带 NVTX 分段的版本（讲义 nsys_profile (e)：对比 softmax 与 matmul）")
     return p.parse_args()
 
 
@@ -129,6 +131,12 @@ def run_step(model, optimizer, x, y, args) -> None:
 def main() -> int:
     args = parse_args()
     torch.manual_seed(args.seed)
+
+    if args.annotate_attention:
+        # 讲义 §2.1.4 的做法：猴子补丁替换掉 attention 实现（计算逻辑不变，只加 NVTX 分段）
+        import cs336_basics.model as _basics_model
+        from cs336_systems.attention_nvtx import annotated_scaled_dot_product_attention
+        _basics_model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
     if args.device.startswith("cuda"):
         torch.cuda.set_device(0)
