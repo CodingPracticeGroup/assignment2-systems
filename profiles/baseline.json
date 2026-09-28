@@ -1,0 +1,34 @@
+{
+  "small_ctx128": {
+    "forward": "RESULT model=small mode=forward dtype=fp32 warmup=5 steps=10 mean_ms=14.974 std_ms=0.094 peak_gb=1.14",
+    "full": "RESULT model=small mode=full dtype=fp32 warmup=5 steps=10 mean_ms=89.028 std_ms=0.340 peak_gb=2.45"
+  },
+  "small_ctx256": {
+    "forward": "RESULT model=small mode=forward dtype=fp32 warmup=5 steps=10 mean_ms=31.949 std_ms=0.030 peak_gb=1.87",
+    "full": "RESULT model=small mode=full dtype=fp32 warmup=5 steps=10 mean_ms=143.878 std_ms=0.337 peak_gb=3.01"
+  },
+  "small_ctx512": {
+    "forward": "RESULT model=small mode=forward dtype=fp32 warmup=5 steps=10 mean_ms=87.026 std_ms=0.060 peak_gb=3.82",
+    "full": "RESULT model=small mode=full dtype=fp32 warmup=5 steps=10 mean_ms=316.572 std_ms=0.185 peak_gb=5.02"
+  },
+  "small_ctx1024": {
+    "forward": "RESULT model=small mode=forward dtype=fp32 warmup=5 steps=10 mean_ms=240.564 std_ms=0.070 peak_gb=9.41",
+    "full": "RESULT model=small mode=full dtype=fp32 warmup=5 steps=10 mean_ms=819.489 std_ms=0.390 peak_gb=10.89"
+  },
+  "medium_ctx128": {
+    "forward": "RESULT model=medium mode=forward dtype=fp32 warmup=5 steps=10 mean_ms=51.013 std_ms=0.080 peak_gb=3.21",
+    "full": "RESULT model=medium mode=full dtype=fp32 warmup=5 steps=10 mean_ms=294.748 std_ms=1.838 peak_gb=7.93"
+  },
+  "medium_ctx256": {
+    "forward": "RESULT model=medium mode=forward dtype=fp32 warmup=5 steps=10 mean_ms=104.008 std_ms=0.184 peak_gb=5.21",
+    "full": "RESULT model=medium mode=full dtype=fp32 warmup=5 steps=10 mean_ms=462.719 std_ms=0.722 peak_gb=8.49"
+  },
+  "medium_ctx512": {
+    "forward": "RESULT model=medium mode=forward dtype=fp32 warmup=5 steps=10 mean_ms=266.486 std_ms=0.088 peak_gb=10.33",
+    "full": "RESULT model=medium mode=full dtype=fp32 warmup=5 steps=10 mean_ms=967.006 std_ms=0.355 peak_gb=13.72"
+  },
+  "medium_ctx1024": {
+    "forward": null,
+    "full": null
+  }
+}
