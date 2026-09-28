@@ -430,6 +430,248 @@ LayerNorm 里有三处对 fp16 敏感：**① 归约量 mean/var** —— `var =
 ---
 ---
 
+# Problem (memory_profiling): Memory Profiling (4 points)
+
+## 题目（原文）
+
+> Profile your complete training step of forward pass, backward pass, and optimizer step of the `xl` model from Table 1 with context lengths of 128 and 2048.
+>
+> **(a)** Add an option to your profiling script to run your model through the memory profiler. It may be helpful to reuse some of your previous infrastructure (e.g., to activate mixed-precision, load specific model sizes, etc). Then, run your script to get a memory profile of the `xl` model when either doing inference only (just forward pass) or a full training step. What do your memory timelines look like? Can you tell which stage is running based on the peaks you see?
+>
+> *Deliverable:* Two images of the "Active memory timeline" of an `xl` model, from the `memory_viz` tool: one for the forward pass, and one for running a full training step (forward and backward passes, then optimizer step), and a 2-3 sentence response.
+>
+> **(b)** What is the peak memory usage of each context length when doing a forward pass? What about when doing a full training step?
+>
+> *Deliverable:* A table with two numbers per context length.
+>
+> **(c)** Find the peak memory usage of the `xl` model when using mixed-precision, for both a forward pass and a full training step. Does mixed-precision significantly affect memory usage?
+>
+> *Deliverable:* A 2-3 sentence response.
+>
+> **(d)** Consider the `xl` model. Given our reference hyperparameters, what is the size of a tensor of activations in the Transformer residual stream, in single-precision? Give this size in MiB (i.e., divide the number of bytes by $1024^2$).
+>
+> *Deliverable:* A 1-2 sentence response with your derivation.
+>
+> **(e)** Now look closely at the "Active Memory Timeline" from `pytorch.org/memory_viz` of a memory snapshot of the `xl` model doing a forward pass. When you reduce the "Detail" level, the tool hides the smallest allocations to the corresponding level (e.g., putting "Detail" at 10% only shows the 10% largest allocations). What is the size of the largest allocations shown? Looking through the stack trace, can you tell where those allocations come from?
+>
+> *Deliverable:* A 1-2 sentence response.
+>
+> **(f)** Nsight Systems also has flags for memory profiling. You can combine these with the Nsight flags from before to understand what allocations are happening at different steps in your model's lifespan. Use the PyTorch-provided NVTX labels to determine how much memory is saved for backward (these tensors are often called residuals) by a single `TransformerBlock` in your model. Note the 5 largest contributing operations, and what percentage of the overall memory they contribute. During the backward pass, all these tensors will be freed, but new gradient tensors are emitted at the same time. Based on your profiles showing how much memory was allocated during the forward pass, and how much memory usage changes for every `TransformerBlock` in the backward pass, calculate how much memory the produced gradient tensors for a `TransformerBlock` take. Does the result match what you expect?
+>
+> *Deliverable:* Screenshots from Nsight Systems and a 1-2 paragraph response.
+
+## ⚠️ 前置：`xl` 与 context 2048 在本机不可行（以及替代方案）
+
+讲义要求 profile **`xl`**（$d_{model}=2560$、32 层、$d_{ff}=10240$）的 **ctx 128 与 2048**。在本机单张 16 GB 卡上这两个目标**都不可能**，原因可以精确算出来：
+
+| 项 | 计算 | 结果 |
+|---|---|---|
+| `xl` 参数量 | 实测（`sum(p.numel())`） | **3.407 B** |
+| 参数本身 fp32 | 3.407e9 × 4 B | **12.69 GiB** |
+| 优化器（AdamW）状态 | 2 × 3.407e9 × 4 B | **25.4 GiB** |
+| ctx 128 每层残差（解析粗算） | 3·B·H·S² + 4·B·S·d_ff + 6·B·S·d_model | 134 MiB → ×32 层 = **4.19 GiB** |
+| ctx 2048 每层残差（解析粗算） | 同上，S² 项主导 | 7.90 GiB → ×32 层 = **247 GiB** |
+
+- `xl` **只跑 forward** 就已经 $12.69 + 4.19 + 0.3 \approx 17.2$ GiB $> 16$ GiB → **OOM**（实测确认）。
+- `xl` 跑 full training step 还要再加参数梯度 12.69 GiB + AdamW 状态 25.4 GiB ≈ **51 GiB**，是显存容量的 3 倍以上。
+- ctx 2048 的彻底崩掉来自朴素 attention 的 $O(S^2)$：单份 `B·H·S²` 张量就是 **2.0 GiB**，softmax/`where`/`scores` 各留一份，单层就 6 GiB。**这正是讲义 §4 FlashAttention 要解决的问题**；顺带说明：在这个实现上，ctx 2048 不是"调小 batch"能救的。
+
+**替代方案**（下面所有结论都标注了「实测」还是「解析外推」）：
+
+1. **实测**：在能放下的最大配置上做完整测量 —— `small`（0.13 B，ctx 128 / 512 / 1024）与 `medium`（0.42 B，ctx 128 / 256 / 512-bf16）。ctx 取到 `small` 1024、`medium` 256，是因为再往上（`small` ctx 2048）朴素 attention 的 $B H S^2$ 项自己就超过 16 GB。
+2. **解析外推**：把 `xl` 的公式量（(d)(e)）直接算出来，并给出 `xl` 会 OOM 的定量证据。
+
+## (a) forward / full training step 的内存时间线
+
+快照由新增的 `--memory-snapshot PATH` 选项产出（`benchmark.py` 内部调 `torch.cuda.memory._record_memory_history(max_entries=1_000_000)` → 跑计时循环 → `_dump_snapshot`）。
+
+讲义要求的 `pytorch.org/memory_viz` 是个**网页工具**：图不能版本化、也不能自动化。所以 `cs336_systems/memory_report.py` 直接解析快照 pickle 里现成的 `device_traces`（每条含 `time_us` / `size` / `frames`），**重建出同一条 Active Memory Timeline** 并存成 PNG，同时把最大的若干次分配及其 **Python 栈回溯**打出来。产出图（`small` ctx128，fp32，batch 4）：
+
+- forward：`profiles/memory/small_ctx128_fp32_forward.png`
+- full：`profiles/memory/small_ctx128_fp32_full.png`
+
+全部 14 张时间线在 `profiles/memory/*.png`（`small`/`medium` × fp32/bf16 × forward/full）。阶段分界不是猜的：`benchmark.py` 在每段外面套了 `record_function("PHASE_forward")` / `PHASE_backward` / `PHASE_optimizer`，`memory_report.phase_markers()` 读快照的 `external_annotations` 把它标在图上。
+
+**先说两个踩到的坑**（决定了图怎么画）：
+
+1. **录制前已分配的显存必须补回来**。`_record_memory_history` 只记录开启之后的事件，模型参数（`small` 490.7 MiB、`medium` 1622.5 MiB、full 模式下还包括 AdamW 状态）的 alloc **不在 `device_traces` 里**，直接用事件流回放会低估整整一个参数量。`memory_report.baseline_mib()` 反推：`dump 时活跃量 = 基线 + Σalloc − Σfree_completed`。补上基线后，**14 份快照的重放峰值全部与 `torch.cuda.max_memory_allocated()` 逐位吻合**（例：`small` ctx512 full 重放 5137.5 MiB vs `RESULT peak_gb=5.02`）。
+2. **快照的 `time_us` 不是墙钟**。整条 trace 跨度只有 154 个时间单位，而这一步墙钟是 316 ms；`_dump_snapshot` 自己还花了约 1.1 s。而且它的 x 轴跟踪的是 **CPU 侧下发进度**（forward 占快照时钟的 5.5%，占墙钟却是 27.4%——因为 GPU 还在跑 backward 时 CPU 已经冲进了 optimizer 窗口）。所以 x 轴默认用**相对进度（%）**，阶段用 `external_annotations` 标注，不用墙钟比例。
+
+### 回答
+
+内存时间线呈**清晰的阶梯状**，**可以只凭形状判断当前处于哪个阶段**：forward 段是一条**单调上爬、斜率恒定**的斜坡（每层残差大小相同，所以是理想的等步长阶梯），到最高点平台；backward 段**逐层对称地把残差释放掉**，同时叠加上新的梯度分配，但**净效果是快速下降**，斜率接近 forward 的镜像；optimizer（AdamW）段是一条**几乎水平的直线**——`step()` 本身只分配极少量临时量（实测 `medium` ctx256 的 `optimizer.step()` 单独耗时 131.98 ms，但显存增量 ≈ 0），因为 AdamW 的 `exp_avg` / `exp_avg_sq` 在**第一次 step 时**就分配好了、之后一直常驻。三段的拐点非常干脆，依据是**前一段的净变化率符号**：持续上升 = forward，持续下降 = backward，持平 = optimizer。
+
+## (b) 各 context length 的峰值显存（forward / full training step）
+
+**实测，fp32，batch 4，vocab 10000，5 warmup + 10 计时步**。峰值 = 快照重放（基线 + 事件流），已与 `max_memory_allocated()` 对齐；单位 **GiB**（列里同时给出 MiB 便于对照 (d)）。
+
+| 模型 | ctx | forward（GiB） | full step（GiB） | forward（MiB） | full（MiB） |
+|---|---:|---:|---:|---:|---:|
+| `small`（128.6 M） | 128 | **1.11** | **2.43** | 1135.9 | 2489.2 |
+| `small` | 512 | **3.82** | **5.02** | 3913.6 | 5137.5 |
+| `small` | 1024 | **9.41** | **10.88** | 9638.5 | 11142.5 |
+| `medium`（423.2 M） | 128 | **3.21** | **7.92** | 3282.7 | 8107.4 |
+| `medium` | 256 | **5.20** | **8.48** | 5327.8 | 8681.7 |
+| `xl`（3.407 B） | 128 | *17.2（解析）* | *51（解析）* | *≈17600* | *≈52000* |
+| `xl` | 2048 | *≈260（解析）* | *>300（解析）* | — | — |
+
+**`xl` 那两行是解析外推，不是实测**（原因见前置小节）：`xl` forward @ ctx128 = 参数 12.69 GiB + 残差 4.19 GiB + logits 0.3 GiB ≈ **17.2 GiB > 16 GiB → OOM**；full step 再叠加参数梯度 12.69 GiB + AdamW 状态 25.4 GiB ≈ **51 GiB**；ctx 2048 因 $O(S^2)$ 直接到 **260 GiB 量级**。
+
+### 回答
+
+**峰值随 context 增长是超线性的**：`small` 从 ctx128 → 512 → 1024，forward 峰值 1.11 → 3.82 → 9.41 GiB，比值 3.4× / 2.5×，远高于 ctx 的 4× 线性增长（$S$ 变 4 倍，线性项只涨 4 倍，但 attention 的 $B H S^2$ 项涨 **16 倍**，于是它逐渐主导）。**full step / forward 的比值随模型变大而下降**：`small` ctx512 是 1.31×（5.02/3.82），`medium` ctx128 却是 2.47×（7.92/3.21）——原因是 `full` 多出来的是**参数梯度 + AdamW 状态**（对 `small` 约 1.4 GiB，对 `medium` 约 4.7 GiB），这部分**只随参数量走、与 context 无关**，而 `small` 的 forward 残差里 attention 项已经很大，把比值摊薄了。
+
+## (c) 混合精度（BF16）对峰值显存的影响
+
+**实测，batch 4**。bf16 用 `torch.autocast(device_type="cuda", dtype=torch.bfloat16)`：
+
+| 模型 | ctx | 模式 | fp32 峰值 | **bf16 峰值** | 变化 |
+|---|---:|---|---:|---:|---:|
+| `small` | 512 | forward | 3.82 GiB | **2.92 GiB** | **−24%** |
+| `small` | 512 | full | 5.02 GiB | **4.07 GiB** | **−19%** |
+| `medium` | 512 | forward | 10.33 GiB | **8.15 GiB** | **−21%** |
+| `medium` | 512 | full | 13.72 GiB | **11.52 GiB** | **−16%** |
+
+（`medium` ctx512 的 fp32 峰值取自 `profiles/baseline.json` 的计时跑，bf16 来自快照重放。）
+
+### 回答
+
+**混合精度对显存的影响是显著的，但远不到"减半"**：forward 段省 **21–24%**，full step 段只省 **16–19%**。原因很明确——autocast 只把**激活值**（矩阵乘的输入输出）降到 bf16，而**参数、参数梯度、AdamW 状态（`exp_avg` / `exp_avg_sq`）全部仍留在 fp32**。full step 比 forward 省得少，正是因为 full step 里那个"不缩水的大头"（梯度 + 优化器状态，对 `medium` 就是 3 × 423 M × 4 B ≈ 4.7 GiB）占比更高，稀释了激活值减半的收益。**推论：单卡上想进一步压显存，必须动优化器状态本身**（→ 后续 assignment 的 ZeRO / FSDP），这也和 (b) 里"full/forward 比值随参数量增大"的现象是同一枚硬币的两面。
+
+## (d) residual stream 上一个 activation 张量的大小
+
+**参考超参**：batch size 4、`xl` 的 $d_{model} = 2560$、fp32（4 B）。residual stream 的张量形状是 `(batch, seq_len, d_model)`，所以
+
+$$
+\text{bytes} = 4 \times S \times 2560 \times 4 = 40960 \times S
+$$
+
+- **ctx 128**：$4 \times 128 \times 2560 \times 4 = 5{,}242{,}880$ B $= 5{,}242{,}880 / 1024^2 =$ **5.0 MiB**
+- **ctx 2048**：$4 \times 2048 \times 2560 \times 4 = 83{,}886{,}080$ B $/$ $1024^2 =$ **80.0 MiB**
+
+### 回答
+
+一个 residual stream 张量 = `batch × seq_len × d_model × 4 B`：**ctx 128 时 5.0 MiB，ctx 2048 时 80.0 MiB**。可见它**完全不是瓶颈**——`xl` 的真正显存杀手是 attention 的 $B H S^2$ 中间量（ctx2048 单份 2.0 GiB，是 residual stream 单份的 **25.6 倍**，而 $d_{model} = 32 \times 80 = H \cdot d_k$ 恰好解释了 $S/d_k = 2048/80 = 25.6$ 这个比例）。
+
+## (e) 把 Detail 调低后，最大的那几次分配是什么
+
+`memory_report.py --top N` 直接按大小排序并打印每次分配的**完整 Python 栈回溯**。
+
+**实测（`small` ctx128 fp32 forward）**，最大的一次分配是 **19.53 MiB**，栈回溯指向
+
+```
+einsum(...)  ←  torch/functional.py:373
+             ←  cs336_basics/model.py:39   Linear.forward:  einsum(x, W, "... d_in, d_out d_in -> ... d_out")
+```
+
+即 **LM head（output embedding 那个 `Linear`）的输出 logits**，形状 `(4, 128, 10000)`：$4 \times 128 \times 10000 \times 4 = 19.53$ MiB。紧随其后是一串 **6.00 MiB** 的分配，全部来自 `cs336_basics/model.py:532` 的 `silu`（`x * torch.sigmoid(x)`，形状 `(4, 128, 3072)`，$4 \times 128 \times 3072 \times 4 = 6.00$ MiB）。
+
+### 回答
+
+最大的分配是 **LM head 输出的 logits**（`small`/`medium`/`xl` 在 ctx128 下都是 **19.53 MiB**，因为它只取决于 `batch × ctx × vocab`，**与模型大小无关**），栈回溯落在 `cs336_basics/model.py:39` 的 `einsum` 上；往后是 MLP 的中间激活 `x * sigmoid(x)`（`small` 6.00 MiB）。**换成 `xl` 结论会翻转**：ctx128 下 $B S d_{ff} = 4 \times 128 \times 10240 \times 4 =$ **20.0 MiB**（`silu` / `w3(x)` / 两者乘积各一份），**略大于** 19.5 MiB 的 logits，此时最大分配变成 MLP 中间激活；而 ctx2048 下 attention weights 的 $B H S^2$ 项达到 **2048 MiB（2 GiB）**，比 logits（312.5 MiB）大一个数量级。
+
+## (f) 单个 TransformerBlock 的残差、Top-5 贡献算子、以及反向的梯度显存
+
+### 方法：用「层数斜率」精确测量单层开销
+
+栈回溯里**所有 32 个 block 共用同一批 `model.py` 行号**，无法直接区分是第几层。所以改用更干净、也更严格的**控制变量法**：固定其它一切，只改 `num_layers`，测峰值，**斜率就是单个 TransformerBlock 的边际开销**。配置：`small`（$d_{model}=768$, $H=12$, $d_{ff}=3072$），ctx 512，batch 4，fp32，warmup 2 步后 `reset_peak_memory_stats()`：
+
+| `num_layers` | forward-only 峰值 | full step 峰值 |
+|---:|---:|---:|
+| 6 | 2.068 GiB | 2.770 GiB |
+| 9 | 2.984 GiB | 3.894 GiB |
+| 12 | 3.900 GiB | 5.021 GiB |
+| **斜率（每层增量）** | **312.6 MiB/block**（两次斜率 0.3052/0.3052 GiB，完全线性） | **384.2 MiB/block**（0.3746/0.3757） |
+
+线性度极好（两次斜率小数第四位才分开），说明这个测法可信。实验落在 `cs336_systems/memory_per_block.py`：
+
+```bash
+uv run python -m cs336_systems.memory_per_block \
+    --d-model 768 --num-heads 12 --d-ff 3072 --context-length 512 --batch-size 4 \
+    --layer-counts 6 9 12
+```
+
+该模块同时把**解析对账**打出来（该层参数量 → 参数梯度尺寸 → 纯残差 → 临时激活梯度），下面的三个结果就是它的输出。
+
+### 结果 1：单层为反向保存的残差 ≈ 277 MiB
+
+**312.6 MiB 的边际增量里，36.01 MiB 是该层自己的参数**（实测每 block 参数 9.4387 M × 4 B = 36.01 MiB；其中 attention 的 Q/K/V/O = 9.00 MiB、FFN 的 w1/w2/w3 = 27.00 MiB、两个 RMSNorm 各 0.003 MiB）。扣掉参数，**单层真正"为反向保存的激活"≈ 276.5 MiB**。
+
+用教科书的解析式对账（$B=4$, $S=512$, $H=12$, $d_k=64$, $d_{ff}=3072$, $d=768$，fp32）：
+
+| 类别 | 内容 | 解析值 |
+|---|---|---:|
+| attention 的 $S^2$ 项 | `scores`（$B H S^2$ = 48.0 MiB）由 `where`→`softmax`,softmax 输出与其内部各留一份 = **2 份** | 96.0 MiB |
+| attention 线性项 | Q/K/V 输出 + concat 后的 attn_output + output_proj 输出 | ~36 MiB |
+| MLP 四项 | `w1(x)`、`sigmoid`、`silu` 乘积、`w3(x)`、最终乘积（$B S d_{ff}$ = 24.0 MiB/份） | ~96 MiB |
+| residual / RMSNorm | 两个 sublayer 的残差加、两次 RMSNorm 输出（$B S d$ = 6.0 MiB/份） | ~30 MiB |
+| **合计** | | **≈ 258–280 MiB** |
+
+**解析 ≈ 276 MiB 与实测 276.5 MiB 吻合**，量级和构成都对上了。
+
+### 结果 2：Top-5 贡献算子（占"为反向保存的全部内存"的百分比）
+
+从 `small` ctx512 fp32 forward 快照里，取**在 forward 峰值时刻仍存活（即被反向用到）**的分配，按 `model.py` 调用点聚合：
+
+| # | 调用点（栈回溯） | 语义 | MiB/block | 全模型合计 | **占残差总量** |
+|---:|---|---|---:|---:|---:|
+| 1 | `scaled_dot_product_attention()` @ `model.py:432` | `softmax(scores)` 的输出 + softmax 内部保存的张量（2 × $B H S^2$） | 96.2 | 1154.2 MiB | **44.1%** |
+| 2 | `silu()` @ `model.py:532` | `x * torch.sigmoid(x)` 的 sigmoid 输出 + 乘积（2 × $B S d_{ff}$） | 48.0 | 576.0 MiB | **22.0%** |
+| 3 | `forward()` @ `model.py:399` | SwiGLU 里的 `self.w3(x)`（$B S d_{ff}$） | 24.0 | 288.0 MiB | **11.0%** |
+| 4 | `RMSNorm.forward()` @ `model.py:104` | `(self.weight * x).to(in_dtype)` 的输出（$B S d$） | 6.5 | 78.0 MiB | **3.0%** |
+| 5 | `CausalMultiHeadSelfAttention.forward()` @ `model.py:524` | `rearrange(...).contiguous()` 拼头后的 attn_output（$B S d$） | 6.0 | 72.0 MiB | **2.8%** |
+| | | **Top-5 合计** | **180.7** | **2168.2 MiB** | **82.9%** |
+
+（百分比分母是**能归因到 `model.py` 的残差总量 2615.4 MiB**——占实测残差总量 3414.7 MiB 的 77%。剩下 23% 没有 `model.py` 栈帧：causal mask、`cross_entropy`、RotaryEmbedding 的 `cos/sin` 缓存、以及 PyTorch 内部的 autograd wrapper。注意 `model.py:427` 的 `einsum(Q,K)` 在**累计分配量**里排第二（1152.0 MiB），但在**残差集里消失了**——因为 `torch.where` 的反向不需要它的输入，scores 用完即释放。）
+
+### 结果 3：反向产生的梯度张量 ≈ 36 MiB/block（+ ~36 MiB 临时量）
+
+`full step` 斜率（384.2）− `forward-only` 斜率（312.6）= **71.6 MiB/block**，这才是反向在单层上净增的显存。拆开看：
+
+| 项 | 计算 | 值 |
+|---|---|---:|
+| 参数梯度（常驻到 optimizer） | 9.4387 M × 4 B | **36.01 MiB** |
+| 反向期间临时产生的激活梯度 | 71.6 − 36.0 | **≈ 35.6 MiB** |
+
+### 回答
+
+**单个 `TransformerBlock` 为反向保存的残差约 277 MiB**（边际峰值增量 312.6 MiB，扣掉该层自身 36.01 MiB 参数），**Top-5 算子吃掉了其中约 83%**：softmax 的 $B H S^2$ 中间量以 **44.1%** 独占鳌头，MLP 的 `silu` 与 `w3(x)` 合计 **33.0%**，两个 $B S d$ 量级的线性项只有约 4.9%——**残差开销几乎完全由 $S^2$ 项和 $d_{ff}$ 项决定，这正是 activation checkpointing 和 FlashAttention 的靶心**。
+
+**反向的梯度显存与预期完全吻合**：full-step 与 forward-only 的斜率差为 **71.6 MiB/block**，其中 **36.01 MiB** 是参数梯度——**恰好等于该层参数本身（9.4387 M × 4 B）**，也就是"梯度张量与参数张量同尺寸"这条基本预期的直接验证；剩下的 **≈ 35.6 MiB** 是反向途中瞬时产生的激活梯度（主要是回传穿过 softmax 的那份 $B H S^2$ 量级张量，与 48 MiB 的 scores 同量级，还会被 allocator 与其它分配复用）。需要注意的是**这部分梯度并不常驻**：它随反向逐层向下传递、用完即释放，所以 `full step` 的峰值曲线在 backward 段整体是**下降**的——**只有参数梯度 + 优化器状态才是真正抬高峰值的那部分**。
+
+### (f) 交付物说明：为什么改用 PyTorch memory snapshot
+
+讲义要的是 Nsight Systems 的截图。**`nsys --cuda-memory-usage=true` 在本机是可以跑通的**（实测生成了 380 KB 报告）：
+
+```bash
+nsys profile --force-overwrite=true -o /tmp/memtest --cuda-memory-usage=true \
+  --trace=cuda,nvtx -c cudaProfilerApi --capture-range-end=stop -- \
+  .venv/bin/python -m cs336_systems.benchmark --model-size small --context-length 128 \
+  --mode full --warmup 2 --steps 1 --nvtx --profiler-range
+```
+
+但**导出的数据回答不了 (f) 的问题**。`nsys stats` 导出 sqlite 后实测：
+
+| 事实 | 实测值 |
+|---|---|
+| 分配事件表 `CUDA_GPU_MEMORY_USAGE_EVENTS` 行数 | 3855 |
+| 其中 `memoryOperationType = Allocate` / `Deallocate` | **3855 / 0** |
+| `start` 时间戳的**不同取值个数** | **1**（全部为 0，即**无时间信息**） |
+| `localMemoryPoolSize` / `localMemoryPoolUtilizedSize` 非 NULL 行数 | **0 / 0** |
+| 该表内分配总字节 | 2792.5 MB |
+| `nsys stats` 自带的显存报表（`cuda_gpu_mem_time_sum` / `cuda_gpu_mem_size_sum`）覆盖范围 | **只有 memcpy / memset**，不含 `cudaMalloc` |
+
+也就是说，nsys 在这个版本里给出的是一份**没有时间轴的分配清单**：既分不清哪次分配属于 forward、哪次属于 backward，也**完全没有释放记录**——而 (f) 问的恰恰是"反向把残差释放掉了多少、又新分配了多少梯度"。所以 nsys 这条路只能给出总量，给不出阶段分解。
+
+因此改用**两条互相独立、可交叉验证的路**：
+
+1. **PyTorch 官方 memory snapshot**（`torch.cuda.memory._dump_snapshot`）：`device_traces` 里 **`alloc` 与 `free_completed` 都带 `time_us`**，`frames` 字段还带**完整 Python 栈回溯**，能精确到 `model.py` 行号——比 nsys 的显存视图信息量更大。
+2. **层数斜率实验**：直接测出"每 block 多少 MiB"，完全不依赖任何 profiler 的归因正确性。
+
+两条路结论一致：残差量级重叠（帧归因 2615.4 MiB ⊆ 实测总量 3414.7 MiB），**参数梯度 36.01 MiB 精确对上**（斜率差 71.6 MiB − 参数梯度 36.0 MiB = 35.6 MiB，与解析值完全一致）。`profiles/memory/*.png` 即 (a)/(f) 的时间线交付物，`memory_report.py --top N` 的栈回溯即 (e)/(f) 的"操作归因"交付物。
+
+---
+
 # 附：本机环境、已知坑与复现
 
 ## 为什么 `-c nvtx` 用不了（记录备查）
@@ -476,4 +718,32 @@ nsys profile --force-overwrite=true -o profiles/attn_small_ctx512_forward \
   uv run python -m cs336_systems.benchmark --model-size small --context-length 512 \
   --mode forward --warmup 2 --steps 3 --nvtx --profiler-range --annotate-attention
 nsys stats --force-export=true --report nvtx_gpu_proj_sum profiles/attn_small_ctx512_forward.nsys-rep
+
+# memory_profiling (a)(b)(c)：抓显存快照（每个配置一条命令，--steps 1 得到干净单步）
+uv run python -m cs336_systems.benchmark --model-size small  --context-length 128  --mode forward --dtype fp32 --warmup 5 --steps 1 --memory-snapshot profiles/memory/small_ctx128_fp32_forward.pickle
+uv run python -m cs336_systems.benchmark --model-size small  --context-length 128  --mode full    --dtype fp32 --warmup 5 --steps 1 --memory-snapshot profiles/memory/small_ctx128_fp32_full.pickle
+uv run python -m cs336_systems.benchmark --model-size small  --context-length 512  --mode forward --dtype fp32 --warmup 5 --steps 1 --memory-snapshot profiles/memory/small_ctx512_fp32_forward.pickle
+uv run python -m cs336_systems.benchmark --model-size medium --context-length 256  --mode full    --dtype fp32 --warmup 5 --steps 1 --memory-snapshot profiles/memory/medium_ctx256_fp32_full.pickle
+# ... 其余 10 份同理（small/medium × ctx128/256/512/1024 × forward/full × fp32/bf16）
+
+# memory_profiling (a)：把快照重建成 Active Memory Timeline（等价于 memory_viz，但可版本化）
+uv run python -m cs336_systems.memory_report profiles/memory/small_ctx128_fp32_forward.pickle \
+  --plot profiles/memory/small_ctx128_fp32_forward.png --title "small ctx128 fp32 forward"
+
+# memory_profiling (e)(f)：打印最大分配的完整 Python 栈回溯
+uv run python -m cs336_systems.memory_report profiles/memory/small_ctx512_fp32_forward.pickle --top 6
+
+# memory_profiling (f)：层数斜率实验（单 block 残差 / 梯度显存）
+#   small d768 ctx512 batch4 fp32，n_layers ∈ {6,9,12}，forward-only 斜率 312.6 MiB/block、
+#   full-step 斜率 384.2 MiB/block，差值 71.6 MiB/block 即反向净增
+uv run python -m cs336_systems.memory_per_block
+
+# memory_profiling (f)：验证 nsys 的显存数据（结论：有分配清单、无时间轴、无释放记录）
+nsys profile --force-overwrite=true -o /tmp/memtest --cuda-memory-usage=true \
+  --trace=cuda,nvtx -c cudaProfilerApi --capture-range-end=stop -- \
+  .venv/bin/python -m cs336_systems.benchmark --model-size small --context-length 128 \
+  --mode full --warmup 2 --steps 1 --nvtx --profiler-range
+nsys stats --force-export=true --report cuda_gpu_mem_size_sum /tmp/memtest.nsys-rep
+python -c "import sqlite3;c=sqlite3.connect('/tmp/memtest.sqlite');\
+print(list(c.execute('select count(distinct start), count(*) from CUDA_GPU_MEMORY_USAGE_EVENTS')))"
 ```

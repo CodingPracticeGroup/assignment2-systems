@@ -66,6 +66,10 @@ def parse_args() -> argparse.Namespace:
                         "配合 nsys -c cudaProfilerApi 跳过 warmup（本机实测：-c nvtx 触发不灵，此路可用）")
     p.add_argument("--annotate-attention", action="store_true",
                    help="把 self-attention 换成带 NVTX 分段的版本（讲义 nsys_profile (e)：对比 softmax 与 matmul）")
+    p.add_argument("--memory-snapshot", metavar="PATH", default=None,
+                   help="用 torch.cuda.memory._record_memory_history 抓显存快照到 PATH"
+                        "（供 pytorch.org/memory_viz 或 cs336_systems.memory_report 使用；"
+                        "建议配 --steps 1 以得到干净的单步时间线）")
     return p.parse_args()
 
 
@@ -78,6 +82,19 @@ def nvtx(msg: str, enabled: bool):
     if not enabled:
         return contextlib.nullcontext()
     return torch.cuda.nvtx.range(msg)
+
+
+def phase_range(msg: str, enabled: bool):
+    """torch.autograd.profiler.record_function 区间。
+
+    抓显存快照时需要它：这些区间会被写进快照的 `external_annotations`，
+    于是能在**快照自己的时钟**上标出 forward/backward/optimizer 的精确边界
+    （用墙钟比例去标是错的——显存分配由 CPU 驱动，会跑到 GPU 前面）。
+    """
+    if not enabled:
+        return contextlib.nullcontext()
+    from torch.autograd.profiler import record_function
+    return record_function(msg)
 
 
 def make_model(args: argparse.Namespace) -> BasicsTransformerLM:
@@ -112,7 +129,7 @@ def run_step(model, optimizer, x, y, args) -> None:
     NVTX 区间按「forward / backward / optimizer」分开，这样 nsys 的
     nvtx_gpu_proj_sum 报表能直接把 GPU 时间拆到这三段上（对应讲义 (a)(d)）。
     """
-    with nvtx("forward", args.nvtx):
+    with nvtx("forward", args.nvtx), phase_range("PHASE_forward", args.memory_snapshot is not None):
         with make_amp_context(args):
             logits = model(x)
             if args.mode == "forward":
@@ -120,10 +137,10 @@ def run_step(model, optimizer, x, y, args) -> None:
             loss = torch.nn.functional.cross_entropy(
                 logits.reshape(-1, logits.size(-1)), y.reshape(-1)
             )
-    with nvtx("backward", args.nvtx):
+    with nvtx("backward", args.nvtx), phase_range("PHASE_backward", args.memory_snapshot is not None):
         loss.backward()
     if args.mode == "full":
-        with nvtx("optimizer", args.nvtx):
+        with nvtx("optimizer", args.nvtx), phase_range("PHASE_optimizer", args.memory_snapshot is not None):
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -166,6 +183,9 @@ def main() -> int:
     # 只采这一段：nsys -c cudaProfilerApi --capture-range-end=stop
     if args.profiler_range:
         torch.cuda.profiler.start()
+    if args.memory_snapshot:
+        # 讲义 §2.1.6：记录显存分配历史（建议 --steps 1，得到干净的单步时间线）
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
     times: list[float] = []
     with nvtx("measure", args.nvtx):
         for _ in range(args.steps):
@@ -176,6 +196,9 @@ def main() -> int:
             if args.device.startswith("cuda"):
                 torch.cuda.synchronize()          # 计时后：等这一步真的跑完
             times.append(timeit.default_timer() - t0)
+    if args.memory_snapshot:
+        torch.cuda.memory._dump_snapshot(args.memory_snapshot)
+        torch.cuda.memory._record_memory_history(enabled=None)
     if args.profiler_range:
         torch.cuda.profiler.stop()
 

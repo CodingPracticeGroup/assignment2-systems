@@ -166,3 +166,4 @@ cython_debug/
 # assignment2: nsys profiling 产物（大文件，不入库）
 profiles/*.nsys-rep
 profiles/*.sqlite
+profiles/memory/*.pickle
