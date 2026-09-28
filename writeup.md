@@ -1,8 +1,7 @@
 # CS336 Assignment 2 (systems) — Writeup
 
-> 本文件用于回答作业中的问答题（自学用途，不提交 Gradescope）。
-> **环境**：2× RTX 4060 Ti 16GB（CC 8.9 / Ada，**无 NVLink**）· 驱动 595.91.07 · CUDA 13.0 · torch 2.11.0+cu130 · nsys 2025.3.2
-> **代码**：`cs336_systems/benchmark.py`、`cs336_systems/profile_nsys.py`、`cs336_systems/attention_nvtx.py`
+> **环境**：2× RTX 4060 Ti 16GB（CC 8.9 / Ada，**无 NVLink**）· 驱动 595.91.07 · CUDA 13.0 · torch 2.11.0+cu130 · nsys 2025.3.2<br>
+> **代码**：`cs336_systems/benchmark.py`、`cs336_systems/profile_nsys.py`、`cs336_systems/attention_nvtx.py`<br>
 > **数据**：`profiles/REPORT.md`（nsys 自动汇总）、`profiles/baseline.json`（timeit 数字）
 >
 > ⚠️ **本机约束（影响部分小问的作答范围）**：只有 16 GB 显存，讲义 Table 1 里的
