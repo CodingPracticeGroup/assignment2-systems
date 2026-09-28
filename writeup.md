@@ -681,6 +681,136 @@ nsys profile --force-overwrite=true -o /tmp/memtest --cuda-memory-usage=true \
 
 ---
 
+# Problem (gradient_checkpointing): Memory-Optimal Gradient Checkpointing (4 points)
+
+## 题目（原文）
+
+> Consider a Transformer with $N$ identical blocks stacked sequentially. Without any checkpointing, all $N$ blocks' worth of residuals are kept alive simultaneously, giving $O(N)$ peak activation memory. We have a free hand to wrap any subset of the forward pass in `checkpoint`, including nesting checkpoint calls inside one another.
+>
+> **(a)** What checkpointing strategy minimizes peak activation memory, ignoring the compute cost? Describe how you would arrange the checkpoint calls (a code sketch is fine), and give the asymptotic peak activation memory and compute of your strategy as a function of $N$. Assume the residuals saved by a single block dominate any per-checkpoint bookkeeping.
+>
+> *Deliverable:* A 3-5 sentence description of the strategy and its asymptotic peak memory, plus a short code sketch.
+>
+> **(b)** Consider the `xl` model config with batch size 4 and sequence length 2048 as above. If you only have the time/compute budget to run one step of recomputation (meaning you may not nest checkpoint calls), what is the best checkpointing strategy to reduce peak memory? Profile your run's peak memory to validate your hypothesis. Compare the peak memory of the next smaller and larger checkpointing block sizes to be sure.
+>
+> *Deliverable:* A 3-5 sentence description of your reasoning along with the measured peak memory for your strategy.
+
+## 前置：三个必须先对齐的口径
+
+**(1) 讲义 §3.2 的 `xl` 用的是 `num_heads=16`，不是 Table 1 的 32。** 讲义那句 "Consider the xl model config ... as above" 指的是 §3.2 的实验片段，而该片段写的是 `num_heads=16`（Table 1 写 32）。这个差别在长 context 下是**翻倍级**的（$B H S^2$ 项 ∝ H）。下表把两个口径都测了。
+
+**(2) 本机设备总显存是 15.82 GiB，不是 16。** `torch.cuda.mem_get_info()` 实测 `total=15.82 GiB`，CUDA context 另占 0.13 GiB，可用约 15.69 GiB。这直接决定了 (b) 的结论。
+
+**(3) `xl` 的 full step 只有 bf16 + `torch.compile` 才装得下。** 参数 + 梯度在 fp32 下是 25.4 GiB（直接出局），在 bf16 下是 **12.70 GiB**（6.35 + 6.35），已占可用的 81%。剩下约 3 GiB 才轮到激活值——**这就是 (b) 的关键约束**。
+
+## 先复现讲义的锚点：单个 TransformerBlock 到底存了多少残差
+
+讲义报的是 **3651.31 MiB**（并据此推出 32 层 = 114 GiB）。用 `saved_tensors_hooks` 复现（`cs336_systems/gradient_checkpointing.py residual`）：
+
+| 配置 | 单个 block 的残差 | 32 层全留存 |
+|---|---:|---:|
+| **`torch.compile` + H=16（= 讲义 §3.2）** | **3651.31 MiB** | **114.1 GiB** ← 与讲义逐位一致 |
+| 不 compile + H=16 | 6602.62 MiB | 206.3 GiB |
+| 不 compile + **H=32（Table 1）** | 9673.62 MiB | 302.3 GiB |
+| `torch.compile` + H=16 + **bf16** | 1826.19 MiB | 57.1 GiB |
+| 不 compile + H=16 + bf16 | 3543.88 MiB | 110.7 GiB |
+
+**3651.31 MiB 这个数字精确复现**，条件是 `torch.compile(block, fullgraph=True)` + `num_heads=16`——这也侧面证明了讲义那段是 compile 过的（算子融合把一批细粒度中间量合成 unitary 算子，残差几乎减半）。按形状归因，`compile` 后的大头是一个 `(64, 2048, 2048)` fp32 = 1024 MiB 和一个 `(4, 16, 2048, 2048)` = 1024 MiB，即**两份 $B H S^2$**，加上 MLP 的两份 `(8192, 10240)` = 640 MiB。
+
+## (a) 最优策略：二分递归嵌套 → 峰值 $O(\log N)$，计算 $O(N\log N)$
+
+**策略**：对整个 block 序列做**二分递归**，在递归树的**每个内部节点**包一层 `checkpoint`，**叶子（单个 block）不再包**。峰值激活显存 = 递归路径上每一层的输入张量（共 $\log_2 N$ 个 residual-stream 张量）+ 当前正在重算的那一个 block 的残差$^\dagger$，即 $O(\log N)$；计算量上，每个 block 被它**所有祖先**的检查点各重算一次，深度 $\log_2 N$，故总重算量 $O(N\log N)$（相对不检查点多了 $O(\log N)$ 次前向）。
+
+```python
+def rec_forward(blocks, x):
+    if len(blocks) == 1:                 # 叶子：外面已有一层 checkpoint 在抑制保存，
+        return blocks[0](x)              #       再包一层只多存一个输入、不减重算量
+    mid = len(blocks) // 2
+    x = checkpoint(lambda inp: rec_forward(blocks[:mid], inp), x, use_reentrant=False)
+    x = checkpoint(lambda inp: rec_forward(blocks[mid:], inp), x, use_reentrant=False)
+    return x
+```
+
+$^\dagger$ **为什么"嵌套"能到 $O(\log N)$ 而不是 $O(N)$**：外层 `checkpoint` 在 forward 阶段**连带抑制了内层的保存**，内层检查点的输入只在**外层反向重算时**才被创建、用完即释放，所以任一时刻存活的只有递归路径上那 $\log_2 N$ 个张量。
+
+**实测证据**（`--mode forward`，只量 forward 阶段的检查点记账；bf16 + compile + xl + ctx2048，一个 residual-stream 张量 = 40 MiB）：
+
+| 策略 | forward 峰值 | 线性拟合折算的 checkpoint 数 |
+|---|---:|---:|
+| `block` k=1（每层一个） | 9.39 GiB | 32 |
+| `block` k=2 | 8.80 GiB | 16 |
+| `block` k=4 | 8.49 GiB | 8 |
+| `block` k=8 | 8.33 GiB | 4 |
+| `block` k=16 | 8.25 GiB | 2 |
+| `block` k=32（单个大检查点） | 8.22 GiB | 1 |
+| **二分递归嵌套** | **8.37 GiB** | **5.0 = $\log_2 32$** ✅ |
+
+按 checkpoint 数对峰值做线性拟合，斜率 **38.6 MiB/个**（理论值 40 MiB = `4×2048×2560×2 B`，误差 3.5%），截距 8.18 GiB。把递归策略的 8.37 GiB 代进去得 **5.04 个**——**正好是 $\log_2 32$**。ctx512 上同样测出 5.3 个（该处一个 residual-stream 张量 = 10 MiB，拟合斜率 9.6 MiB）。**$O(N)$ 与 $O(\log N)$ 的差别被直接量了出来。**
+
+另外注意：**forward-only 的单步耗时在所有策略下完全相同**（ctx2048 都是 1631–1633 ms）——checkpointing 在 forward 阶段是**零成本**的，重算开销全部落在 backward。
+
+### 回答
+
+峰值激活显存的**最优策略是二分递归嵌套 checkpoint**（每个内部节点包一层，叶子不包），峰值 $O(\log N)$、重算量 $O(N\log N)$，代码如上面的 `rec_forward`。当 $N$ 很大时，$O(\log N)$ 已是**渐近最优**——因为无论如何都至少要物化一个 block 的残差才能对它做反向，而检查点又必须沿路径保留分隔点，$\log N$ 是二者的下界。**但要强调一个反直觉的实测结论**：由于每个检查点只需存一个 residual-stream 张量（$B S d_{model}$），而一个 block 的残差是它的**几十倍**（ctx2048 下 40 MiB vs 1826 MiB，**46×**），所以当 $N$ 只有 32 时，递归省下的 $32\times40 - 5\times40 \approx 1.1$ GiB 相对"参数+梯度 12.7 GiB"几乎可以忽略——**在本机 xl ctx2048 上，递归与非嵌套 k=1 的峰值完全相同（都是 14.85 GiB），而递归还慢了 47%**。$O(\log N)$ 的收益只有在 $N$ 很大、或每个 block 的残差被 FlashAttention 压小之后才会兑现。
+
+## (b) `xl` @ ctx2048，只允许一层重算
+
+### 推理：最优 block size 是 **k=1**（每层一个 checkpoint）
+
+一层重算的峰值显存是两项之和，用 $N=32$ 层、每段 $k$ 层：
+
+$$\text{peak}(k) \approx \underbrace{\frac{N}{k}\cdot c_{\text{cp}}}_{\text{所有检查点同时存活}} + \underbrace{k\cdot c_{\text{block}}}_{\text{重算窗口内物化的残差}},\qquad c_{\text{cp}} = B S d_{model}\cdot 2 = 40\ \text{MiB}$$
+
+其中 $c_{\text{cp}}$ 是"存一个检查点"的代价，$c_{\text{block}}$ 是"物化一个 block 的残差"的代价。对 $k$ 求极小：
+
+$$k^\* = \sqrt{\frac{N\,c_{\text{cp}}}{c_{\text{block}}}} = \sqrt{\frac{32 \times 40}{1826}} = 0.84 \;\Rightarrow\; \boxed{k^\* = 1}$$
+
+**因为一个检查点的代价（40 MiB）比一个 block 的残差（1826 MiB）小 46 倍，检查点几乎是免费的，所以应该尽可能多放——下界就是每层一个。** 这也意味着 $k$ 在 $1 \to 32$ 上的峰值**单调递增，没有 U 形**，题目说的"更小的 block size"**不存在**。
+
+### 实测（xl，H=16，batch 4，ctx 2048，bf16 + `torch.compile`，`--mode full`）
+
+固定开销：参数 6.35 GiB + 梯度 6.35 GiB = **12.70 GiB**（可用的 81%）。
+
+| 策略 | 峰值显存 | 单步耗时 |
+|---|---:|---:|
+| 不 checkpoint（`none`） | **OOM**（bf16+compile 下也需 57 GiB） | — |
+| `block` k=32 / 16 / 8 / 4 / 2 | **OOM** | — |
+| **`block` k=1** | **14.85 GiB** | **6826 ms** |
+| **二分递归嵌套**（(a) 的策略） | **14.85 GiB** | 10044 ms |
+
+**k=1 就是唯一能装下的一层重算策略**，"更大的 block size"（k=2）实测 OOM，假设由此得到验证。
+
+### 降规模交叉验证：peak(k) 曲线（所有 k 都能装下时）
+
+在 ctx2048 上只有 k=1 能跑，看不到曲线形状，所以在两个更小的 context 上把整条曲线测了出来（同一配置，只改 ctx）：
+
+| 策略 | ctx 512 | ctx 1024 | ctx 2048 |
+|---|---:|---:|---:|
+| **递归嵌套** | **13.18** | **13.36** | **14.85** |
+| `block` k=1 | 13.44 | 13.36 | 14.85 |
+| `block` k=2 | 13.54 | 13.80 | OOM |
+| `block` k=4 | 13.98 | 14.69 | OOM |
+| `block` k=8 | 14.97 | OOM | OOM |
+| `block` k=16 | OOM | OOM | OOM |
+| `block` k=32 | OOM | OOM | OOM |
+| 不 checkpoint | OOM | OOM | OOM |
+
+**峰值随 $k$ 单调上升、$k=1$ 处取最小，完全符合 $k^\*=1$ 的预测**；且每个 context 都有一个"再大就 OOM"的阈值（ctx512 是 k=8 之后，ctx1024 是 k=4 之后）。
+
+### 回答
+
+**最佳策略是每层放一个 checkpoint（k=1）**，因为一个检查点的代价（一个 residual-stream 张量，40 MiB）只有单个 block 残差（1826 MiB）的 1/46，检查点近乎免费，所以应取一层重算所能取的最小粒度；解析最优 $k^\*=\sqrt{Nc_{\text{cp}}/c_{\text{block}}}=0.84$ 夹到 1，实测的 peak(k) 曲线也**单调递增**，证实不存在比 k=1 更优或更小的选择。**在 ctx2048 上，k=1 实测峰值 14.85 GiB，是唯一能跑通的一层重算策略**（k≥2 全部 OOM），这与"参数+梯度就吃掉 12.70 GiB、只剩约 3 GiB 给激活"的预算一致。**两个值得记录的推论**：① 由于最优解被夹到下界 k=1，题目预期的"U 形曲线"在本题参数下**不会出现**（要出现需要 $N c_{\text{cp}} > c_{\text{block}}$，即约 $N>46$ 层）；② 用 (a) 的递归策略能把峰值压到和 k=1 相同的 14.85 GiB，但因为峰值已被参数+梯度主导，**它一个字节都没省下，反而慢了 47%**（10044 vs 6826 ms）——**只有当单个 block 的残差被压小（FlashAttention）之后，嵌套的 $O(\log N)$ 才谈得上收益**。
+
+## 这一题踩到的三个坑（都会伪装成"配置不可行"）
+
+| 坑 | 现象 | 根因与修法 |
+|---|---|---|
+| **构造时的 fp32 瞬时峰值** | xl bf16 full step 稳定 OOM，但 `max_memory_allocated` 只到 14.59 GiB | `Model(...).to(bf16)` 会先建一份**全量 fp32 参数**再转换，把建模型的峰值顶到 **12.87 GiB**，之后 allocator 的 reserved 池一直虚高。**修法**：`torch.set_default_dtype(bf16)` 后用目标 dtype 直接构造（峰值降到 6.35 GiB，full step 随即跑通） |
+| **梯度不释放 → 连锁 OOM** | 单独跑 recursive 成功（14.85 GiB），一扫描却**全策略 OOM** | ① 跑到一半 OOM 时 backward 已给部分参数分配了 `.grad`（xl ≈ 6.35 GiB），不清掉会让后面每个策略都 OOM；② `one_step` 里梯度跨步累积，第 2 步开始时上一步的 6.35 GiB 还在。**修法**：每轮前后都 `zero_grad(set_to_none=True)` + `gc.collect()` + `empty_cache()`，并让每步开始时释放上一步梯度（真实训练循环本来就如此） |
+| **`expandable_segments`** | reserved 已到 15.29 GiB 仍 OOM | 默认 allocator 的段不可增长，碎片吃掉余量。**修法**：`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（已写进模块，在任何 CUDA 调用前 `os.environ.setdefault`） |
+
+---
+
 # 附：本机环境、已知坑与复现
 
 ## 为什么 `-c nvtx` 用不了（记录备查）
@@ -755,4 +885,27 @@ nsys profile --force-overwrite=true -o /tmp/memtest --cuda-memory-usage=true \
 nsys stats --force-export=true --report cuda_gpu_mem_size_sum /tmp/memtest.nsys-rep
 python -c "import sqlite3;c=sqlite3.connect('/tmp/memtest.sqlite');\
 print(list(c.execute('select count(distinct start), count(*) from CUDA_GPU_MEMORY_USAGE_EVENTS')))"
+
+# gradient_checkpointing (a)：复现讲义 §3.2 的 3651.31 MiB（要点：--compile + --num-heads 16）
+uv run python -m cs336_systems.gradient_checkpointing residual \
+  --model-size xl --num-heads 16 --context-length 2048 --batch-size 4 --dtype fp32 --compile
+# 对照口径（Table 1 的 H=32 / 不 compile / bf16）
+uv run python -m cs336_systems.gradient_checkpointing residual \
+  --model-size xl --num-heads 32 --context-length 2048 --batch-size 4 --dtype fp32
+
+# gradient_checkpointing (b)：xl @ ctx2048，只有 bf16 + compile + expandable_segments 装得下
+#   （设备总显存实测 15.82 GiB；参数+梯度 bf16 = 12.70 GiB）
+uv run python -m cs336_systems.gradient_checkpointing scan \
+  --model-size xl --num-heads 16 --context-length 2048 --batch-size 4 --dtype bf16 \
+  --compile-blocks --block-sizes 1 2 4 8 16 32 --with-recursive --with-none --mode full \
+  --warmup 1 --steps 3
+# 降规模交叉验证 peak(k) 曲线（ctx512 / ctx1024 上所有 k 都能装下）
+uv run python -m cs336_systems.gradient_checkpointing scan \
+  --model-size xl --num-heads 16 --context-length 512 --batch-size 4 --dtype bf16 \
+  --compile-blocks --block-sizes 1 2 4 8 16 32 --with-recursive --with-none --mode full --warmup 1 --steps 3
+
+# gradient_checkpointing (a)：量 forward 阶段的 checkpoint 记账（O(N) vs O(log N)）
+uv run python -m cs336_systems.gradient_checkpointing scan \
+  --model-size xl --num-heads 16 --context-length 2048 --batch-size 4 --dtype bf16 \
+  --compile-blocks --block-sizes 1 2 4 8 16 32 --with-recursive --mode forward --warmup 1 --steps 3
 ```
